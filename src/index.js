@@ -5,44 +5,60 @@ import { processPayment } from './services/paymentService.js';
 const app = express();
 app.use(express.json());
 
-const AMQP_URL = 'amqp://localhost';
+const AMQP_URL = process.env.AMQP_URL || 'amqp://localhost';
+const PAYMENT_EXCHANGE = 'payment_exchange';
+const PAYMENT_QUEUE = 'payment_request_queue';
 
 async function setupMessageQueue() {
   try {
     const connection = await amqpConnect(AMQP_URL);
+    console.log('Connected to RabbitMQ');
+    
     const channel = await connection.createChannel();
+    console.log('Channel created');
 
-    await channel.assertExchange('payment_exchange', 'direct');
-    await channel.assertQueue('payment_request_queue');
+    await channel.assertExchange(PAYMENT_EXCHANGE, 'direct');
+    await channel.assertQueue(PAYMENT_QUEUE);
     await channel.bindQueue(
-      'payment_request_queue',
-      'payment_exchange',
+      PAYMENT_QUEUE,
+      PAYMENT_EXCHANGE,
       'payment_request'
     );
 
-    channel.consume('payment_request_queue', async (msg) => {
+    console.log('Exchange and queues configured');
+
+    channel.consume(PAYMENT_QUEUE, async (msg) => {
       if (msg) {
         const order = JSON.parse(msg.content.toString());
         console.log('Received payment request for order:', order.id);
 
         try {
-          const success = await processPayment(order);
+          const paymentResult = await processPayment(order);
+          
           channel.publish(
-            'payment_exchange',
+            PAYMENT_EXCHANGE,
             'payment_result',
             Buffer.from(JSON.stringify({
               orderId: order.id,
-              success
+              success: true,
+              transactionId: paymentResult.transactionId,
+              errorMessage: null
             }))
           );
+          
+          console.log(`Payment processed successfully for order ${order.id}`);
+          
         } catch (error) {
-          console.error('Payment processing failed:', error);
+          console.error('Payment processing failed:', error.message);
+          
           channel.publish(
-            'payment_exchange',
+            PAYMENT_EXCHANGE,
             'payment_result',
             Buffer.from(JSON.stringify({
               orderId: order.id,
-              success: false
+              success: false,
+              transactionId: null,
+              errorMessage: error.message
             }))
           );
         }
@@ -51,9 +67,35 @@ async function setupMessageQueue() {
       }
     });
 
+    connection.on('error', (error) => {
+      console.error('RabbitMQ connection error:', error);
+    });
+
+    channel.on('error', (error) => {
+      console.error('RabbitMQ channel error:', error);
+    });
+
     console.log('Message queue setup completed');
   } catch (error) {
     console.error('Failed to setup message queue:', error);
     process.exit(1);
   }
 }
+
+app.get('/health', (req, res) => {
+  res.status(200).json({ status: 'UP' });
+});
+
+app.use((err, req, res, next) => {
+  console.error('Unhandled error:', err);
+  res.status(500).json({
+    error: 'Internal server error',
+    message: err.message
+  });
+});
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+  console.log(`Payment gateway service listening on port ${PORT}`);
+  setupMessageQueue();
+});
